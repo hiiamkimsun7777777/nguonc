@@ -3,13 +3,14 @@ const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const PORT = Number(process.env.PORT || 7000);
 const API_BASE = (process.env.NGUONC_API_BASE || "https://phim.nguonc.com/api").replace(/\/+$/, "");
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 5 * 60 * 1000);
-const PAGE_SIZE = 24;
+// NguonC currently returns 10 films per page (see response.paginate).
+const PAGE_SIZE = 10;
 
 const cache = new Map();
 
 const manifest = {
   id: "vn.nguonc.stremio",
-  version: "1.0.0",
+  version: "1.1.0",
   name: "NguonC Việt Nam",
   description: "Phim Việt hóa từ NguonC API cho Stremio.",
   logo: "https://phim.nguonc.com/favicon.ico",
@@ -114,8 +115,13 @@ function imageUrl(value) {
   return `https://phim.nguonc.com/${v.replace(/^\/+/, "")}`;
 }
 
+function categoryGroups(category) {
+  // The film detail API returns category as an object keyed by "1", "2", ...
+  return Array.isArray(category) ? category : Object.values(category || {});
+}
+
 function detectType(movie) {
-  const groups = Array.isArray(movie?.category) ? movie.category : [];
+  const groups = categoryGroups(movie?.category);
   const names = groups.flatMap(group =>
     Array.isArray(group?.list) ? group.list.map(x => cleanText(x?.name).toLowerCase()) : []
   );
@@ -124,8 +130,7 @@ function detectType(movie) {
   return "series";
 }
 
-function preview(movie) {
-  const type = detectType(movie);
+function preview(movie, type) {
   const poster = imageUrl(movie?.poster_url || movie?.thumb_url);
 
   return {
@@ -230,27 +235,33 @@ function isDirectMedia(url) {
 
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
   try {
+    if ((type === "movie" && id !== "nguonc_latest_movies") ||
+        (type === "series" && id !== "nguonc_latest_series")) return { metas: [] };
     const search = cleanText(extra?.search);
     const skip = Number(extra?.skip || 0);
     const apiPage = Math.floor(skip / PAGE_SIZE) + 1;
 
-    let data;
-    if (search) {
-      data = await api(`films/search?keyword=${encodeURIComponent(search)}&page=${apiPage}`);
-    } else {
-      data = await api(`films/phim-moi-cap-nhat?page=${apiPage}`);
-    }
+    const endpoint = search
+      ? `films/search?keyword=${encodeURIComponent(search)}&page=${apiPage}`
+      : `films/danh-sach/${type === "movie" ? "phim-le" : "phim-bo"}?page=${apiPage}`;
+    const data = await api(endpoint);
 
     const items = Array.isArray(data?.items) ? data.items : [];
-
-    const metas = items
-      .map(preview)
-      .filter(item => item.type === type)
-      .slice(0, PAGE_SIZE);
+    // Search results have no category. Look up detail before assigning a type.
+    const selected = search ? (await Promise.all(items.map(async movie => {
+      try {
+        const detail = await api(`film/${encodeURIComponent(movie.slug)}`);
+        return detectType(detail?.movie) === type ? movie : null;
+      } catch (error) {
+        console.error(`SEARCH TYPE ERROR (${movie.slug}):`, error);
+        return null;
+      }
+    }))).filter(Boolean) : items;
+    const metas = selected.slice(skip % PAGE_SIZE).map(movie => preview(movie, type));
 
     return { metas };
   } catch (error) {
-    console.error("CATALOG ERROR:", error.message);
+    console.error("CATALOG ERROR:", error);
     return { metas: [] };
   }
 });
@@ -295,8 +306,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
 });
 
 function extractGenres(category) {
-  if (!Array.isArray(category)) return [];
-  return category
+  return categoryGroups(category)
     .flatMap(group => Array.isArray(group?.list) ? group.list : [])
     .map(x => cleanText(x?.name))
     .filter(Boolean)
