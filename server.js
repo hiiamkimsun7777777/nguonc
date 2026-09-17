@@ -1,379 +1,226 @@
+"use strict";
+
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 
 const PORT = Number(process.env.PORT || 7000);
 const API_BASE = (process.env.NGUONC_API_BASE || "https://phim.nguonc.com/api").replace(/\/+$/, "");
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 5 * 60 * 1000);
-// NguonC currently returns 10 films per page (see response.paginate).
-const PAGE_SIZE = 10;
-
+const CACHE_MS = Number(process.env.CACHE_TTL_MS || 300000);
+const PAGE_SIZE = 10; // NguonC paginate.items_per_page, verified against the live API.
 const cache = new Map();
+
+const catalogs = [
+  { type: "movie", id: "nguonc_movies", name: "NguồnC • Phim lẻ", path: "films/danh-sach/phim-le" },
+  { type: "series", id: "nguonc_series", name: "NguồnC • Phim bộ", path: "films/danh-sach/phim-bo" }
+];
 
 const manifest = {
   id: "vn.nguonc.stremio",
-  version: "1.1.0",
-  name: "NguonC Việt Nam",
-  description: "Phim Việt hóa từ NguonC API cho Stremio.",
-  logo: "https://phim.nguonc.com/favicon.ico",
+  version: "2.0.0",
+  name: "NguồnC Việt Nam",
+  description: "Danh sách, thông tin phim và tập từ API NguồnC.",
   resources: [
-    {
-      name: "catalog",
-      types: ["movie", "series"],
-      idPrefixes: ["nguonc:"]
-    },
-    {
-      name: "meta",
-      types: ["movie", "series"],
-      idPrefixes: ["nguonc:"]
-    },
-    {
-      name: "stream",
-      types: ["movie", "series"],
-      idPrefixes: ["nguonc:"]
-    }
+    "catalog",
+    { name: "meta", types: ["movie", "series"], idPrefixes: ["nguonc:"] },
+    { name: "stream", types: ["movie", "series"], idPrefixes: ["nguonc:"] }
   ],
   types: ["movie", "series"],
-  catalogs: [
-    {
-      type: "movie",
-      id: "nguonc_latest_movies",
-      name: "NguonC - Phim mới",
-      extra: [
-        { name: "search", isRequired: false },
-        { name: "skip", isRequired: false }
-      ]
-    },
-    {
-      type: "series",
-      id: "nguonc_latest_series",
-      name: "NguonC - Phim bộ",
-      extra: [
-        { name: "search", isRequired: false },
-        { name: "skip", isRequired: false }
-      ]
-    }
-  ]
+  catalogs: catalogs.map(({ type, id, name }) => ({
+    type, id, name,
+    extra: [{ name: "search", isRequired: false }, { name: "skip", isRequired: false }]
+  }))
 };
 
 const builder = new addonBuilder(manifest);
+const str = value => value == null ? "" : String(value).trim();
+const idFor = slug => `nguonc:${slug}`;
+const slugFor = id => str(id).startsWith("nguonc:") ? str(id).slice(7) : "";
+const groups = category => Array.isArray(category) ? category : Object.values(category || {});
 
-function cacheGet(key) {
-  const item = cache.get(key);
-  if (!item) return null;
-  if (Date.now() - item.time > CACHE_TTL_MS) {
-    cache.delete(key);
-    return null;
-  }
-  return item.data;
+function fieldList(category, groupName) {
+  return groups(category)
+    .filter(group => str(group?.group?.name).toLowerCase() === groupName.toLowerCase())
+    .flatMap(group => Array.isArray(group.list) ? group.list : [])
+    .map(item => str(item?.name)).filter(Boolean);
 }
 
-function cacheSet(key, data) {
-  cache.set(key, { time: Date.now(), data });
-  return data;
+function movieType(movie) {
+  const formats = fieldList(movie?.category, "Định dạng").map(x => x.toLowerCase());
+  if (formats.includes("phim lẻ")) return "movie";
+  if (formats.includes("phim bộ")) return "series";
+  return Number(movie?.total_episodes) > 1 ? "series" : "movie";
+}
+
+function image(value) {
+  const url = str(value);
+  if (!url) return undefined;
+  if (/^https?:\/\//i.test(url)) return url;
+  return `https://phim.nguonc.com/${url.replace(/^\/+/, "")}`;
+}
+
+function remember(key, value) {
+  cache.set(key, { value, expires: Date.now() + CACHE_MS });
+  if (cache.size > 500) cache.delete(cache.keys().next().value);
+  return value;
 }
 
 async function api(path) {
   const url = `${API_BASE}/${path.replace(/^\/+/, "")}`;
-  const cached = cacheGet(url);
-  if (cached) return cached;
+  const cached = cache.get(url);
+  if (cached && cached.expires > Date.now()) return cached.value;
 
   const response = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      "User-Agent": "NguonC-Stremio-Addon/1.0"
-    },
+    headers: { Accept: "application/json", "User-Agent": "NguonC-Stremio-Addon/2.0" },
     signal: AbortSignal.timeout(15000)
   });
-
   if (!response.ok) {
-    throw new Error(`NguonC HTTP ${response.status}: ${url}`);
+    const body = (await response.text()).replace(/\s+/g, " ").slice(0, 160);
+    throw new Error(`NguonC API HTTP ${response.status}: ${url}; ${body}`);
   }
-
   const data = await response.json();
-  return cacheSet(url, data);
-}
-
-function idFor(slug) {
-  return `nguonc:${slug}`;
-}
-
-function slugFromId(id) {
-  const value = String(id || "");
-  if (value.startsWith("nguonc:")) {
-    return value.slice("nguonc:".length);
-  }
-  return value;
-}
-
-function cleanText(value) {
-  return value == null ? "" : String(value).trim();
-}
-
-function imageUrl(value) {
-  const v = cleanText(value);
-  if (!v) return undefined;
-  if (/^https?:\/\//i.test(v)) return v;
-  return `https://phim.nguonc.com/${v.replace(/^\/+/, "")}`;
-}
-
-function categoryGroups(category) {
-  // The film detail API returns category as an object keyed by "1", "2", ...
-  return Array.isArray(category) ? category : Object.values(category || {});
-}
-
-function detectType(movie) {
-  const groups = categoryGroups(movie?.category);
-  const names = groups.flatMap(group =>
-    Array.isArray(group?.list) ? group.list.map(x => cleanText(x?.name).toLowerCase()) : []
-  );
-
-  if (names.includes("phim lẻ") || names.includes("phim le")) return "movie";
-  return "series";
+  if (data?.status !== "success") throw new Error(`NguonC API error: ${url}`);
+  return remember(url, data);
 }
 
 function preview(movie, type) {
-  const poster = imageUrl(movie?.poster_url || movie?.thumb_url);
-
+  const poster = image(movie.poster_url || movie.thumb_url);
+  if (!movie.slug || !movie.name || !poster) return null;
   return {
-    id: idFor(movie.slug),
-    type,
-    name: cleanText(movie.name),
-    poster,
-    posterShape: "poster",
-    description: cleanText(movie.description),
-    releaseInfo: cleanText(movie.year),
-    imdbRating: movie?.imdb_rating ? Number(movie.imdb_rating) : undefined
+    id: idFor(movie.slug), type, name: str(movie.name), poster,
+    posterShape: "poster", description: str(movie.description),
+    releaseInfo: str(movie.year)
   };
 }
 
+function episodeNumber(item, index) {
+  const text = str(item?.name || item?.slug);
+  const match = text.match(/(?:tập|tap|episode|ep)[\s-]*(\d+)/i) || text.match(/^(\d+)$/);
+  return match ? Number(match[1]) : index + 1;
+}
+
+function episodeItems(movie) {
+  const seen = new Set();
+  const result = [];
+  for (const server of Array.isArray(movie?.episodes) ? movie.episodes : []) {
+    for (const item of Array.isArray(server?.items) ? server.items : []) {
+      if (!item.slug || seen.has(item.slug)) continue;
+      seen.add(item.slug);
+      result.push(item);
+    }
+  }
+  return result;
+}
+
 function episodeId(movieSlug, episodeSlug) {
-  return `nguonc:${movieSlug}:ep:${episodeSlug}`;
+  return `${idFor(movieSlug)}:ep:${episodeSlug}`;
 }
 
-function parseEpisodeId(id) {
-  const value = String(id || "");
-  const match = value.match(/^nguonc:(.+):ep:(.+)$/);
-  if (!match) return null;
-  return { movieSlug: match[1], episodeSlug: match[2] };
-}
-
-function toVideos(movie) {
-  const videos = [];
-  const episodes = Array.isArray(movie?.episodes) ? movie.episodes : [];
-
-  for (const server of episodes) {
-    const items = Array.isArray(server?.items) ? server.items : [];
-
-    for (const item of items) {
-      const epName = cleanText(item?.name) || cleanText(item?.slug);
-      if (!item?.slug) continue;
-
-      videos.push({
-        id: episodeId(movie.slug, item.slug),
-        title: epName,
-        season: 1,
-        episode: extractEpisodeNumber(epName),
-        released: movie?.modified?.time || undefined,
-        thumbnail: imageUrl(movie?.thumb_url || movie?.poster_url)
-      });
-    }
-  }
-
-  // Some single movies may have no episode list.
-  if (!videos.length) {
-    videos.push({
-      id: idFor(movie.slug),
-      title: "Full",
+function metaFrom(movie, type) {
+  const poster = image(movie.poster_url || movie.thumb_url);
+  const meta = {
+    id: idFor(movie.slug), type, name: str(movie.name), poster,
+    background: image(movie.poster_url || movie.thumb_url),
+    posterShape: "poster", description: str(movie.description),
+    releaseInfo: str(movie.year), runtime: str(movie.time),
+    genres: fieldList(movie.category, "Thể loại"),
+    country: fieldList(movie.category, "Quốc gia").join(", ") || undefined,
+    director: str(movie.director) ? [str(movie.director)] : undefined,
+    cast: str(movie.casts) ? str(movie.casts).split(",").map(str).filter(Boolean) : undefined
+  };
+  if (type === "series") {
+    meta.videos = episodeItems(movie).map((item, index) => ({
+      id: episodeId(movie.slug, item.slug),
+      title: str(item.name) || `Tập ${index + 1}`,
       season: 1,
-      episode: 1,
-      thumbnail: imageUrl(movie?.thumb_url || movie?.poster_url)
-    });
+      episode: episodeNumber(item, index)
+    }));
   }
-
-  return videos;
+  // Movies have one implicit video whose ID equals meta.id (Stremio protocol).
+  return meta;
 }
 
-function extractEpisodeNumber(name) {
-  const text = cleanText(name);
-  const match = text.match(/(?:tập|tap|episode|ep)\s*([0-9]+)/i) || text.match(/^([0-9]+)$/);
-  return match ? Number(match[1]) : 1;
-}
-
-function findEpisode(movie, episodeSlug) {
-  const episodes = Array.isArray(movie?.episodes) ? movie.episodes : [];
-
-  for (const server of episodes) {
-    const items = Array.isArray(server?.items) ? server.items : [];
-    const item = items.find(x => cleanText(x?.slug) === cleanText(episodeSlug));
-    if (item) {
-      return {
-        serverName: cleanText(server?.server_name) || "NguonC",
-        item
-      };
-    }
+function streamFor(url, serverName, itemName) {
+  const value = str(url);
+  if (!/^https?:\/\//i.test(value)) return null;
+  const title = `${serverName} • ${itemName}`;
+  if (/\.(m3u8|mp4|webm|mkv)(?:[?#]|$)/i.test(value)) {
+    return { name: "NguồnC", title, url: value };
   }
-  return null;
-}
-
-function streamCandidates(item) {
-  // NguonC versions commonly expose an embed URL. Some mirrors may also expose
-  // m3u8/mp4 fields. Prefer direct media URLs when available.
-  const values = [
-    item?.link_m3u8,
-    item?.m3u8,
-    item?.url,
-    item?.file,
-    item?.link,
-    item?.embed
-  ].filter(Boolean);
-
-  return [...new Set(values.map(v => cleanText(v)).filter(Boolean))];
-}
-
-function isDirectMedia(url) {
-  return /\.(m3u8|mp4|webm|mkv)(\?.*)?$/i.test(url);
+  return { name: "NguồnC", title: `${title} (mở trình duyệt)`, externalUrl: value };
 }
 
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
+  const catalog = catalogs.find(x => x.type === type && x.id === id);
+  if (!catalog) return { metas: [] };
+  const skip = Math.max(0, Number.parseInt(extra?.skip, 10) || 0);
+  const page = Math.floor(skip / PAGE_SIZE) + 1;
+  const search = str(extra?.search);
+  const path = search
+    ? `films/search?keyword=${encodeURIComponent(search)}&page=${page}`
+    : `${catalog.path}?page=${page}`;
   try {
-    if ((type === "movie" && id !== "nguonc_latest_movies") ||
-        (type === "series" && id !== "nguonc_latest_series")) return { metas: [] };
-    const search = cleanText(extra?.search);
-    const skip = Number(extra?.skip || 0);
-    const apiPage = Math.floor(skip / PAGE_SIZE) + 1;
-
-    const endpoint = search
-      ? `films/search?keyword=${encodeURIComponent(search)}&page=${apiPage}`
-      : `films/danh-sach/${type === "movie" ? "phim-le" : "phim-bo"}?page=${apiPage}`;
-    const data = await api(endpoint);
-
-    const items = Array.isArray(data?.items) ? data.items : [];
-    // Search results have no category. Look up detail before assigning a type.
-    const selected = search ? (await Promise.all(items.map(async movie => {
-      try {
-        const detail = await api(`film/${encodeURIComponent(movie.slug)}`);
-        return detectType(detail?.movie) === type ? movie : null;
-      } catch (error) {
-        console.error(`SEARCH TYPE ERROR (${movie.slug}):`, error);
-        return null;
-      }
-    }))).filter(Boolean) : items;
-    const metas = selected.slice(skip % PAGE_SIZE).map(movie => preview(movie, type));
-
-    return { metas };
+    const data = await api(path);
+    const items = Array.isArray(data.items) ? data.items : [];
+    let selected = items;
+    if (search) {
+      selected = (await Promise.all(items.map(async item => {
+        try {
+          const detail = await api(`film/${encodeURIComponent(item.slug)}`);
+          return movieType(detail.movie) === type ? item : null;
+        } catch (error) {
+          console.error("Search detail failed:", item.slug, error);
+          return null;
+        }
+      }))).filter(Boolean);
+    }
+    return { metas: selected.slice(skip % PAGE_SIZE).map(item => preview(item, type)).filter(Boolean) };
   } catch (error) {
     console.error("CATALOG ERROR:", error);
-    return { metas: [] };
+    throw error; // Show a request failure instead of falsely reporting an empty catalog.
   }
 });
 
 builder.defineMetaHandler(async ({ type, id }) => {
+  const slug = slugFor(id);
+  if (!slug || !["movie", "series"].includes(type)) return { meta: {} };
   try {
-    const slug = slugFromId(id);
-    const data = await api(`film/${encodeURIComponent(slug)}`);
-    const movie = data?.movie;
-
+    const { movie } = await api(`film/${encodeURIComponent(slug)}`);
     if (!movie) return { meta: {} };
-
-    const poster = imageUrl(movie.poster_url || movie.thumb_url);
-    const background = imageUrl(movie.poster_url || movie.thumb_url);
-
-    const meta = {
-      id: idFor(movie.slug),
-      type,
-      name: cleanText(movie.name),
-      poster,
-      background,
-      posterShape: "poster",
-      description: cleanText(movie.description),
-      releaseInfo: cleanText(movie.year),
-      director: cleanText(movie.director) ? [cleanText(movie.director)] : undefined,
-      cast: cleanText(movie.casts)
-        ? cleanText(movie.casts).split(",").map(x => x.trim()).filter(Boolean)
-        : undefined,
-      runtime: cleanText(movie.time),
-      genres: extractGenres(movie.category),
-      videos: type === "series" ? toVideos(movie) : toVideos(movie).slice(0, 1),
-      behaviorHints: {
-        defaultVideoId: type === "series" ? undefined : idFor(movie.slug)
-      }
-    };
-
-    return { meta };
+    return { meta: metaFrom(movie, type) };
   } catch (error) {
-    console.error("META ERROR:", error.message);
-    return { meta: {} };
+    console.error("META ERROR:", error);
+    throw error;
   }
 });
 
-function extractGenres(category) {
-  return categoryGroups(category)
-    .flatMap(group => Array.isArray(group?.list) ? group.list : [])
-    .map(x => cleanText(x?.name))
-    .filter(Boolean)
-    .slice(0, 20);
-}
-
 builder.defineStreamHandler(async ({ type, id }) => {
+  if (!["movie", "series"].includes(type)) return { streams: [] };
+  const match = str(id).match(/^nguonc:([^:]+)(?::ep:(.+))?$/);
+  if (!match) return { streams: [] };
+  const [, slug, episodeSlug] = match;
   try {
-    let movieSlug = slugFromId(id);
-    let episodeSlug = null;
-
-    const parsed = parseEpisodeId(id);
-    if (parsed) {
-      movieSlug = parsed.movieSlug;
-      episodeSlug = parsed.episodeSlug;
-    }
-
-    const data = await api(`film/${encodeURIComponent(movieSlug)}`);
-    const movie = data?.movie;
+    const { movie } = await api(`film/${encodeURIComponent(slug)}`);
     if (!movie) return { streams: [] };
-
-    if (!episodeSlug) {
-      // Movie: select the first playable episode/item.
-      const videos = toVideos(movie);
-      episodeSlug = videos[0]?.id?.split(":ep:")[1] || null;
-    }
-
-    const episode = episodeSlug ? findEpisode(movie, episodeSlug) : null;
-    if (!episode) return { streams: [] };
-
-    const candidates = streamCandidates(episode.item);
     const streams = [];
-
-    for (const url of candidates) {
-      if (isDirectMedia(url)) {
-        streams.push({
-          name: `NguonC • ${episode.serverName}`,
-          title: cleanText(episode.item?.name) || "NguonC",
-          url
-        });
-      } else {
-        // An embed page is not necessarily a direct media file. Stremio can
-        // expose it as an external link instead of pretending it is a stream.
-        streams.push({
-          name: `NguonC • ${episode.serverName}`,
-          title: `${cleanText(episode.item?.name) || "Xem trên nguồn"} (External)`,
-          externalUrl: url
-        });
+    for (const server of Array.isArray(movie.episodes) ? movie.episodes : []) {
+      const items = Array.isArray(server.items) ? server.items : [];
+      const item = episodeSlug
+        ? items.find(x => str(x.slug) === episodeSlug)
+        : items[0];
+      if (!item) continue;
+      const serverName = str(server.server_name) || "Máy chủ";
+      const itemName = str(item.name) || str(item.slug) || "Xem phim";
+      const candidates = [item.m3u8, item.link_m3u8, item.mp4, item.url, item.file, item.embed];
+      for (const candidate of new Set(candidates.filter(Boolean))) {
+        const stream = streamFor(candidate, serverName, itemName);
+        if (stream) streams.push(stream);
       }
     }
-
     return { streams };
   } catch (error) {
-    console.error("STREAM ERROR:", error.message);
-    return { streams: [] };
+    console.error("STREAM ERROR:", error);
+    throw error;
   }
 });
 
 serveHTTP(builder.getInterface(), { port: PORT });
-
-console.log("");
-console.log("==============================================");
-console.log(" NguonC → Stremio Add-on");
-console.log("==============================================");
-console.log(` Local:    http://127.0.0.1:${PORT}/manifest.json`);
-console.log(` Network:  http://YOUR-IP:${PORT}/manifest.json`);
-console.log("");
-console.log("Đưa URL /manifest.json vào Stremio > Add-ons.");
-console.log("Nếu deploy lên hosting, dùng HTTPS URL của hosting.");
-console.log("");
+console.log(`NguonC Stremio addon v${manifest.version} listening on port ${PORT}`);
