@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: nguonc-stremio-addon
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /manifest.json
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: NGUONC_API_BASE
+        value: https://phim.nguonc.com/api
+      - key: CACHE_TTL_MS
+        value: 300000
